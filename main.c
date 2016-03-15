@@ -3,8 +3,8 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-const int spp = 16;
-/* const int spp = 64; */
+/* const int spp = 16; */
+const int spp = 256;
 const int maxDepth = 4;
 const int width = 512;
 const int height = 512;
@@ -19,6 +19,7 @@ typedef struct Material Material;
 typedef struct Ray Ray;
 typedef struct Triple Triple;
 typedef struct Camera Camera;
+typedef struct Plane Plane;
 
 struct Triple {
 	double v[3];
@@ -53,6 +54,7 @@ double clamp(double x);
 unsigned char gammaTransform(double x);
 void render(int numObjects, Object* objects, Camera* camera, char* buffer);
 void writePPM(char* path, char* buffer);
+void normalize(Triple* v);
 
 double doubleRand() {
 	// TODO Implement our own less random but faster rand().
@@ -63,6 +65,12 @@ Triple scale(Triple* inp, double x) {
 	return (Triple){
 		{inp->v[0] * x, inp->v[1] * x, inp->v[2] * x}
 	};
+}
+
+void scalePointer(Triple* inp, double x) {
+	inp->v[0] *= x;
+	inp->v[1] *= x;
+	inp->v[2] *= x;
 }
 
 Triple multiplyParts(Triple *x1, Triple *x2) {
@@ -242,14 +250,66 @@ Material newDiffuse(Triple color, Triple emiss, bool dielectric) {
 }
 
 typedef struct {
+	Triple col;
+	Triple emiss;
+	bool dielectric;
+} Specular;
+
+Triple specularF(Material* material, Triple *wi, Triple *wo, Triple *normal);
+SampleHit specularSampleF(Material* material, Triple *normal, Triple *wo);
+Triple specularEmiss(Material* materal);
+
+Triple specularF(Material* material, Triple *wi, Triple *wo, Triple *normal) {
+	return ((Specular*)material->data)->col;
+}
+
+SampleHit specularSampleF(Material* material, Triple *normal, Triple *wo) {
+	Triple inverse = scale(wo, -1);
+	Triple normalDoubled = scale(normal, 2);
+	scalePointer(&normalDoubled, innerProduct(normal, wo));
+	addPointer(&inverse, &normalDoubled);
+	normalize(&inverse);
+	double pdf = innerProduct(normal, &inverse);
+
+	return (SampleHit){
+		.dir = inverse,
+		.pdf = pdf
+	};
+}
+
+Triple specularEmiss(Material *material) {
+	return ((Specular*)(material->data))->emiss;
+}
+
+bool specularDielectric(Material *material) {
+	return ((Specular*)(material->data))->dielectric;
+}
+
+const Material specularBase = (Material){
+	.f = specularF,
+	.sampleF = specularSampleF,
+	.emiss = specularEmiss
+};
+
+Material newSpecular(Triple color, Triple emiss, bool dielectric) {
+	Specular* specularData = malloc(sizeof(Specular));
+	specularData->col = color;
+	specularData->emiss = emiss;
+	specularData->dielectric = dielectric;
+
+	Material specular = specularBase;
+	specular.data = specularData;
+
+	return specular;
+}
+
+typedef struct {
 	Triple pos;
 	double rad;
-	/* Material* mat; */
 	double invRad;
 } Sphere;
 
 SimpleHit sphereIntersect(Object *object, Ray *ray) {
-	// printf("ray: (%0.3f, %0.3f, %0.3f)\n", ray->dir.v[0], ray->dir.v[1], ray->dir.v[2]);
 	Sphere* sphere = (Sphere*)(object->data);
 
 	Triple op = subtract(&sphere->pos, &ray->org);
@@ -294,17 +354,61 @@ Object newSphere(Triple position, double radius, Material* material) {
 	Sphere* sphereData = malloc(sizeof(Sphere));
 	sphereData->pos = position;
 	sphereData->rad = radius;
-	/* sphereData->mat = material; */
 	sphereData->invRad = 1.0 / radius;
 
 	Object sphere = sphereBase;
 	sphere.data = sphereData;
 	sphere.material = material;
 
-/* 	printf("in new\n"); */
-/* printf("emit: %f, %f, %f\n", material->emiss(material).v[0], material->emiss(material).v[1], material->emiss(material).v[2]); */
-/*  printf("babbab\n"); */
 	return sphere;
+}
+
+struct Plane {
+	Triple pos;
+	Triple normal;
+};
+
+SimpleHit planeIntersect(Object *object, Ray *ray) {
+	// Based on equation at https://www.cl.cam.ac.uk/teaching/1999/AGraphHCI/SMAG/node2.html
+
+	Plane* plane = (Plane*)(object->data);
+
+	double bottom = innerProduct(&plane->normal, &ray->dir);
+
+	if (bottom > -epsilon && bottom < epsilon) {
+		return (SimpleHit){.t = INFINITY};
+	}
+
+	Triple posSubOrg = subtract(&plane->pos, &ray->org);
+	double top = innerProduct(&plane->normal, &posSubOrg);
+	top /= bottom;
+
+	if (top < epsilon) {
+		return (SimpleHit){.t = INFINITY};
+	}
+
+	return (SimpleHit){.t = top, .object = object, .normal = plane->normal};
+}
+
+Triple planeNormal(Object *object, Ray *ray, double t) {
+	return ((Plane*)(object->data))->normal;
+}
+
+const Object planeBase = (Object){
+	.intersect = planeIntersect,
+	.normal = planeNormal
+};
+
+Object newPlane(Triple position, Triple normal, Material* material) {
+	Plane* planeData = malloc(sizeof(Plane));
+	planeData->pos = position;
+	planeData->normal = normal;
+
+	Object plane = planeBase;
+	plane.data = planeData;
+	plane.material = material;
+
+	return plane;
 }
 
 Triple sampleHemi(double u1, double u2, double exp) {
@@ -361,31 +465,43 @@ int main() {
 	Material whiteDiffuse = newDiffuse((Triple){1, 1, 1}, (Triple){0, 0, 0}, false);
 	Material greenDiffuse = newDiffuse((Triple){0, 1, 0}, (Triple){0, 0, 0}, false);
 	Material redDiffuse = newDiffuse((Triple){1, 0, 0}, (Triple){0, 0, 0}, false);
+	Material blueDiffuse = newDiffuse((Triple){0, 0, 1}, (Triple){0, 0, 0}, false);
 
-	Triple mine = ((Diffuse*)whiteDiffuse.data)->col;
+	// Unique materials.
+	Material whiteMirror = newSpecular((Triple){1, 1, 1}, (Triple){0, 0, 0}, false);
+	Material cyanSpecular = newSpecular((Triple){0.2, 0.6, 0.6}, (Triple){0, 0, 0}, false);
 
-	const int numObjects = 7;
+	const int numObjects = 10;
 
-	Object objects[7] = {
+	Object objects[10] = {
 		newSphere((Triple){0, -40, 0}, 24.0, (Material*)&whiteLight),
 
 		// Ceiling.
-		newSphere((Triple){0, -520, 0}, 500.0, (Material*)&whiteDiffuse),
+		newPlane((Triple){0, -20, 0}, (Triple){0, 1, 0}, (Material*)&whiteDiffuse),
 
 		// Back wall.
-		newSphere((Triple){0, 0, -480}, 500.0, (Material*)&whiteDiffuse),
+		newPlane((Triple){0, 0, 20}, (Triple){0, 0, -1}, (Material*)&whiteDiffuse),
 
 		// Front wall.
-		newSphere((Triple){0, 0, -620}, 500.0, (Material*)&whiteDiffuse),
+		newPlane((Triple){0, 0, -80}, (Triple){0, 0, 1}, (Material*)&whiteDiffuse),
 
 		// Floor.
-		newSphere((Triple){0, -480, 0}, 500.0, (Material*)&whiteDiffuse),
+		newPlane((Triple){0, 20, 0}, (Triple){0, -1, 0}, (Material*)&whiteDiffuse),
 
 		// Left wall.
-		newSphere((Triple){-520, 0, 0}, 500.0, (Material*)&greenDiffuse),
+		newPlane((Triple){-20, 0, 0}, (Triple){1, 0, 0}, (Material*)&greenDiffuse),
 
 		// Right wall.
-		newSphere((Triple){-480, 0, 0}, 500.0, (Material*)&redDiffuse)
+		newPlane((Triple){20, 0, 0}, (Triple){-1, 0, 0}, (Material*)&redDiffuse),
+
+		// Blue ball back-right.
+		newSphere((Triple){-6, 0, 14}, 6, (Material*)&blueDiffuse),
+
+		// White specular back-left.
+		newSphere((Triple){8, 0, 12}, 8, (Material*)&whiteMirror),
+
+		// Plane cutting back-left corner.
+		newPlane((Triple){16, -16, 0}, (Triple){1, -1, 1}, (Material*)&cyanSpecular)
 	};
 
 	Camera camera = newCamera(
@@ -393,6 +509,9 @@ int main() {
 		(Triple){{0, 0, 0}},
 		400,
 		(Triple){{0, 1, 0}});
+
+	Material* mat = objects[6].material;
+	Triple col = ((Diffuse*)mat->data)->col;
 
 	///////// START TEST CODE
 	/* Sphere* sp = (Sphere*)(objects[0].data); */
