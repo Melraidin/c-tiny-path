@@ -5,6 +5,7 @@
 
 /* const int spp = 16; */
 const int spp = 256;
+/* const int spp = 4096; */
 const int maxDepth = 4;
 const int width = 512;
 const int height = 512;
@@ -25,8 +26,8 @@ struct Triple {
 	double v[3];
 };
 
-const Triple BLACK = (Triple){{0, 0, 0}};
-const Triple MAGENTA = (Triple){{1.0, 0, 1.0}};
+Triple BLACK;
+Triple MAGENTA;
 
 struct SimpleHit {
 	double t;
@@ -179,11 +180,15 @@ bool emitDielectric(Material *material) {
 	return emitter->dielectric;
 }
 
-const Material emitterBase = (Material){
-	.f = emitF,
-	.sampleF = emitSampleF,
-	.emiss = emitEmiss
-};
+Material emitterBase;
+
+void emitterInit() {
+	emitterBase = (Material){
+		.f = emitF,
+		.sampleF = emitSampleF,
+		.emiss = emitEmiss
+	};
+}
 
 Material newEmitter(Triple emiss, bool dielectric) {
 	Emitter* emitterData = malloc(sizeof(Emitter));
@@ -231,11 +236,15 @@ bool diffuseDielectric(Material *material) {
 	return diffuse->dielectric;
 }
 
-const Material diffuseBase = (Material){
-	.f = diffuseF,
-	.sampleF = diffuseSampleF,
-	.emiss = diffuseEmiss
-};
+Material diffuseBase;
+
+void diffuseInit() {
+	diffuseBase = (Material){
+		.f = diffuseF,
+		.sampleF = diffuseSampleF,
+		.emiss = diffuseEmiss
+	};
+}
 
 Material newDiffuse(Triple color, Triple emiss, bool dielectric) {
 	Diffuse* diffuseData = malloc(sizeof(Diffuse));
@@ -285,11 +294,15 @@ bool specularDielectric(Material *material) {
 	return ((Specular*)(material->data))->dielectric;
 }
 
-const Material specularBase = (Material){
-	.f = specularF,
-	.sampleF = specularSampleF,
-	.emiss = specularEmiss
-};
+Material specularBase;
+
+void specularInit() {
+	specularBase = (Material){
+		.f = specularF,
+		.sampleF = specularSampleF,
+		.emiss = specularEmiss
+	};
+}
 
 Material newSpecular(Triple color, Triple emiss, bool dielectric) {
 	Specular* specularData = malloc(sizeof(Specular));
@@ -345,10 +358,14 @@ Triple sphereNormal(Object *object, Ray *ray, double t) {
 	return scale(&unnormalized, sphere->invRad);
 }
 
-const Object sphereBase = (Object){
-	.intersect = sphereIntersect,
-	.normal = sphereNormal
-};
+Object sphereBase;
+
+void sphereInit() {
+	sphereBase = (Object){
+		.intersect = sphereIntersect,
+		.normal = sphereNormal
+	};
+}
 
 Object newSphere(Triple position, double radius, Material* material) {
 	Sphere* sphereData = malloc(sizeof(Sphere));
@@ -394,10 +411,14 @@ Triple planeNormal(Object *object, Ray *ray, double t) {
 	return ((Plane*)(object->data))->normal;
 }
 
-const Object planeBase = (Object){
-	.intersect = planeIntersect,
-	.normal = planeNormal
-};
+Object planeBase;
+
+void planeInit() {
+	planeBase = (Object){
+		.intersect = planeIntersect,
+		.normal = planeNormal
+	};
+}
 
 Object newPlane(Triple position, Triple normal, Material* material) {
 	Plane* planeData = malloc(sizeof(Plane));
@@ -460,6 +481,16 @@ Triple orientNormal(Triple *normal, Triple *wo) {
 }
 
 int main() {
+	BLACK = (Triple){{0, 0, 0}};
+	MAGENTA = (Triple){{1.0, 0, 1.0}};
+
+	emitterInit();
+	diffuseInit();
+	specularInit();
+
+	sphereInit();
+	planeInit();
+
 	Material whiteLight = newEmitter((Triple){1.25, 1.125, 0.875}, false);
 
 	// Wall, ceiling, and floor materials.
@@ -600,22 +631,25 @@ void render(int numObjects, Object* objects, Camera* camera, char* buffer) {
 	double halfWidth = (double)width / 2;
 	double halfHeight = (double)height / 2;
 
-	for (double y = 0; y < height; y++) {
-		for (double x = 0; x < width; x++) {
+#pragma omp parallel for schedule(dynamic, 1)
+	for (int y = 0; y < height; y++) {
+	  double dY = (double)y;
+		for (int x = 0; x < width; x++) {
 			Triple px = (Triple){{0, 0, 0}};
 
 			for (int s = 0; s < spp; s++) {
-				double sx = (x + doubleRand()) - halfWidth;
-				double sy = (y + doubleRand()) - halfHeight;
+				double sx = ((double)x + doubleRand()) - halfWidth;
+				double sy = (dY + doubleRand()) - halfHeight;
 				Ray ray = cameraSpawnRay(camera, sx, sy);
 				Triple rad = radiance(numObjects, objects, &ray, 0);
 				Triple scaled = scale(&rad, sppInv);
 				addPointer(&px, &scaled);
 			}
 
-			*buffer++ = gammaTransform(px.v[0]);
-			*buffer++ = gammaTransform(px.v[1]);
-			*buffer++ = gammaTransform(px.v[2]);
+			int i = ((y * width) + x) * 3;
+			buffer[i] = gammaTransform(px.v[0]);
+			buffer[i + 1] = gammaTransform(px.v[1]);
+			buffer[i + 2] = gammaTransform(px.v[2]);
 		}
 	}
 }

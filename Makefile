@@ -8,4 +8,4 @@ clean:
 	rm $(BIN) || true
 
 build:
-	gcc -o tiny-path -O3 main.c
+	gcc-4.9 -std=c99 -o tiny-path -O3 -fopenmp main.c
