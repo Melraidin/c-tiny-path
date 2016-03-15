@@ -402,6 +402,7 @@ const Object planeBase = (Object){
 Object newPlane(Triple position, Triple normal, Material* material) {
 	Plane* planeData = malloc(sizeof(Plane));
 	planeData->pos = position;
+	normalize(&normal);
 	planeData->normal = normal;
 
 	Object plane = planeBase;
