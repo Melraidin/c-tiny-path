@@ -3,15 +3,22 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-/* const int spp = 16; */
-const int spp = 256;
-/* const int spp = 4096; */
-const int maxDepth = 4;
+/* #define DEBUG 1 */
+#ifdef DEBUG
+#define debug(M, ...) printf(M, ##__VA_ARGS__)
+#else
+#define debug(M, ...)
+#endif
+
+/* const int spp = 64; */
+/* const int spp = 4; */
+const int spp = 1024;
+const int maxDepth = 8;
 const int width = 512;
 const int height = 512;
 
-const double invertedPi = 1 / 3.1415926535;
-const double twoPi = 2 * 3.1415926535;
+const double invertedPi = 1.0 / 3.1415926535;
+const double twoPi = 2.0 * 3.1415926535;
 const double epsilon = 1e-14;
 
 typedef struct SimpleHit SimpleHit;
@@ -21,6 +28,7 @@ typedef struct Ray Ray;
 typedef struct Triple Triple;
 typedef struct Camera Camera;
 typedef struct Plane Plane;
+typedef struct Triangle Triangle;
 
 struct Triple {
 	double v[3];
@@ -56,6 +64,8 @@ unsigned char gammaTransform(double x);
 void render(int numObjects, Object* objects, Camera* camera, char* buffer);
 void writePPM(char* path, char* buffer);
 void normalize(Triple* v);
+Triple radiance(int numObjects, Object* objects, Ray* ray, int depth);
+Triple diRadiance(int numObjects, Object* objects, Ray* ray, Triple* normal, Material* mat, int depth);
 
 double doubleRand() {
 	// TODO Implement our own less random but faster rand().
@@ -144,6 +154,7 @@ struct Object {
 	Material* material;
 	SimpleHit (*intersect)(Object *object, Ray *ray);
 	Triple (*normal)(Object *object, Ray *ray, double t);
+	void (*print)(Object *object);
 };
 
 typedef struct {
@@ -186,7 +197,8 @@ void emitterInit() {
 	emitterBase = (Material){
 		.f = emitF,
 		.sampleF = emitSampleF,
-		.emiss = emitEmiss
+		.emiss = emitEmiss,
+		.dielectric = emitDielectric
 	};
 }
 
@@ -242,7 +254,8 @@ void diffuseInit() {
 	diffuseBase = (Material){
 		.f = diffuseF,
 		.sampleF = diffuseSampleF,
-		.emiss = diffuseEmiss
+		.emiss = diffuseEmiss,
+		.dielectric = diffuseDielectric
 	};
 }
 
@@ -300,7 +313,8 @@ void specularInit() {
 	specularBase = (Material){
 		.f = specularF,
 		.sampleF = specularSampleF,
-		.emiss = specularEmiss
+		.emiss = specularEmiss,
+		.dielectric = specularDielectric
 	};
 }
 
@@ -314,6 +328,60 @@ Material newSpecular(Triple color, Triple emiss, bool dielectric) {
 	specular.data = specularData;
 
 	return specular;
+}
+
+typedef struct {
+	Triple col;
+} Refractive;
+
+Triple refractiveF(Material* material, Triple *wi, Triple *wo, Triple *normal);
+SampleHit refractiveSampleF(Material* material, Triple *normal, Triple *wo);
+Triple refractiveEmiss(Material* materal);
+
+Triple refractiveF(Material* material, Triple *wi, Triple *wo, Triple *normal) {
+	return ((Refractive*)material->data)->col;
+}
+
+SampleHit refractiveSampleF(Material* material, Triple *normal, Triple *wo) {
+	Triple wi = scale(wo, -1);
+	Triple newNormal = scale(normal, 2);
+	scalePointer(&newNormal, innerProduct(normal, wo));
+	addPointer(&wi, &newNormal);
+	normalize(&wi);
+	return (SampleHit){
+		.dir = wi,
+		.pdf = innerProduct(normal, &wi)
+	};
+}
+
+Triple refractiveEmiss(Material *material) {
+	// TODO Worth supporting this?
+	return (Triple){0, 0, 0};
+}
+
+bool refractiveDielectric(Material *material) {
+	return true;
+}
+
+Material refractiveBase;
+
+void refractiveInit() {
+	refractiveBase = (Material){
+		.f = refractiveF,
+		.sampleF = refractiveSampleF,
+		.emiss = refractiveEmiss,
+		.dielectric = refractiveDielectric
+	};
+}
+
+Material newRefractive(Triple color) {
+	Refractive* refractiveData = malloc(sizeof(Refractive));
+	refractiveData->col = color;
+
+	Material refractive = refractiveBase;
+	refractive.data = refractiveData;
+
+	return refractive;
 }
 
 typedef struct {
@@ -358,12 +426,21 @@ Triple sphereNormal(Object *object, Ray *ray, double t) {
 	return scale(&unnormalized, sphere->invRad);
 }
 
+void spherePrint(Object *object) {
+	Sphere* sphere = (Sphere*)(object->data);
+	debug(
+		"Sphere - center: (%f, %f, %f), radius: %f",
+		sphere->pos.v[0], sphere->pos.v[1], sphere->pos.v[2],
+		sphere->rad);
+}
+
 Object sphereBase;
 
 void sphereInit() {
 	sphereBase = (Object){
 		.intersect = sphereIntersect,
-		.normal = sphereNormal
+		.normal = sphereNormal,
+		.print = spherePrint
 	};
 }
 
@@ -411,12 +488,20 @@ Triple planeNormal(Object *object, Ray *ray, double t) {
 	return ((Plane*)(object->data))->normal;
 }
 
+void planePrint(Object *object) {
+	Plane* plane = (Plane*)(object->data);
+	debug("Plane - point: (%f, %f, %f), normal: (%f, %f, %f)",
+		plane->pos.v[0], plane->pos.v[1], plane->pos.v[2],
+		plane->normal.v[0], plane->normal.v[1], plane->normal.v[2]);
+}
+
 Object planeBase;
 
 void planeInit() {
 	planeBase = (Object){
 		.intersect = planeIntersect,
-		.normal = planeNormal
+		.normal = planeNormal,
+		.print = planePrint
 	};
 }
 
@@ -431,6 +516,87 @@ Object newPlane(Triple position, Triple normal, Material* material) {
 	plane.material = material;
 
 	return plane;
+}
+
+struct Triangle {
+	Triple v[3];
+	Triple a;
+	Triple b;
+	Triple normal;
+};
+
+SimpleHit triangleIntersect(Object *object, Ray *ray) {
+	// Based on Möller-Trumbore implementation at:
+	// http://www.scratchapixel.com/lessons/3d-basic-rendering/ray-tracing-rendering-a-triangle/moller-trumbore-ray-triangle-intersection
+
+	Triangle* triangle = (Triangle*)(object->data);
+
+	Triple pvec = crossProduct(&ray->dir, &triangle->b);
+	double det = innerProduct(&triangle->a, &pvec);
+
+	if (abs(det) < epsilon) {
+		return (SimpleHit){.t = INFINITY};
+	}
+
+	double invDet = 1.0 / det;
+
+	Triple tvec = subtract(&ray->org, &triangle->v[0]);
+	double u = innerProduct(&tvec, &pvec) * invDet;
+	if (u < 0 || u > 1) {
+		return (SimpleHit){.t = INFINITY};
+	}
+
+	Triple qvec = crossProduct(&tvec, &triangle->a);
+	double v = innerProduct(&ray->dir, &qvec) * invDet;
+	if (v < 0 || u + v > 1) {
+		return (SimpleHit){.t = INFINITY};
+	}
+
+	double t = innerProduct(&triangle->b, &qvec) * invDet;
+	if (t > -epsilon && t < epsilon) {
+		return (SimpleHit){.t = INFINITY};
+	}
+
+	return (SimpleHit){.t = t, .object = object, .normal = triangle->normal};
+}
+
+Triple triangleNormal(Object *object, Ray *ray, double t) {
+	return ((Triangle*)(object->data))->normal;
+}
+
+void trianglePrint(Object *object) {
+	Triangle* triangle = (Triangle*)(object->data);
+	debug("Triangle - (%f, %f, %f), (%f, %f, %f), (%f, %f, %f)",
+		triangle->v[0].v[0], triangle->v[0].v[1], triangle->v[0].v[2],
+		triangle->v[1].v[0], triangle->v[1].v[1], triangle->v[1].v[2],
+		triangle->v[2].v[0], triangle->v[2].v[1], triangle->v[2].v[2]);
+}
+
+Object triangleBase;
+
+void triangleInit() {
+	triangleBase = (Object){
+		.intersect = triangleIntersect,
+		.normal = triangleNormal,
+		.print = trianglePrint
+	};
+}
+
+Object newTriangle(Triple v0, Triple v1, Triple v2, Material* material) {
+	Triangle* triangleData = malloc(sizeof(Triangle));
+	triangleData->v[0] = v0;
+	triangleData->v[1] = v1;
+	triangleData->v[2] = v2;
+	triangleData->a = subtract(&v1, &v0);
+	triangleData->b = subtract(&v2, &v0);
+	triangleData->normal = crossProduct(&triangleData->a, &triangleData->b);
+	normalize(&triangleData->normal);
+
+	Object triangle = triangleBase;
+	triangle.data = triangleData;
+	triangle.material = material;
+
+	return triangle;
 }
 
 Triple sampleHemi(double u1, double u2, double exp) {
@@ -487,9 +653,11 @@ int main() {
 	emitterInit();
 	diffuseInit();
 	specularInit();
+	refractiveInit();
 
 	sphereInit();
 	planeInit();
+	triangleInit();
 
 	Material whiteLight = newEmitter((Triple){1.25, 1.125, 0.875}, false);
 
@@ -502,10 +670,12 @@ int main() {
 	// Unique materials.
 	Material whiteMirror = newSpecular((Triple){1, 1, 1}, (Triple){0, 0, 0}, false);
 	Material cyanSpecular = newSpecular((Triple){0.2, 0.6, 0.6}, (Triple){0, 0, 0}, false);
+	Material glass = newRefractive((Triple){0.8, 0.999, 0.1});
+	Material pinkDiff = newDiffuse((Triple){0.9, 0.25, 0.9}, (Triple){0, 0, 0}, false);
 
-	const int numObjects = 10;
+	const int numObjects = 12;
 
-	Object objects[10] = {
+	Object objects[12] = {
 		newSphere((Triple){0, -40, 0}, 24.0, (Material*)&whiteLight),
 
 		// Ceiling.
@@ -533,7 +703,13 @@ int main() {
 		newSphere((Triple){8, 0, 12}, 8, (Material*)&whiteMirror),
 
 		// Plane cutting back-left corner.
-		newPlane((Triple){16, -16, 0}, (Triple){1, -1, 1}, (Material*)&cyanSpecular)
+		newPlane((Triple){16, -16, 0}, (Triple){1, -1, 1}, (Material*)&cyanSpecular),
+
+		// First refractive.
+		newSphere((Triple){-8, 10, 0}, 8, (Material*)&glass),
+
+		// Vertical triangle, front-right.
+		newTriangle((Triple){-19, 4, -10}, (Triple){-10, 19, -10}, (Triple){-19, 19, -20}, &pinkDiff),
 	};
 
 	Camera camera = newCamera(
@@ -542,16 +718,25 @@ int main() {
 		400,
 		(Triple){{0, 1, 0}});
 
-	Material* mat = objects[6].material;
-	Triple col = ((Diffuse*)mat->data)->col;
-
 	///////// START TEST CODE
 	/* Sphere* sp = (Sphere*)(objects[0].data); */
 
 	/* Ray test = (Ray){ */
 	/* 	.org = (Triple){{0, 0, 0}}, */
-	/* 	.dir = (Triple){{0, -1, 0}} */
+	/* 	.dir = (Triple){{-8, 10, 0}} */
 	/* }; */
+
+	/* Ray test = (Ray){ */
+	/* 	.org = (Triple){{-3.002440, 3.753050, 0.000000}}, */
+	/* 	.dir = (Triple){{-0.624695, 0.780869, 0.000000}} */
+	/* }; */
+
+	/* normalize(&test.dir); */
+	/* printf("norm dir: %f, %f, %f\n", test.dir.v[0], test.dir.v[1], test.dir.v[2]); */
+
+	/* Triple rad = radiance(numObjects, objects, &test, 0); */
+	/* printf("rad: %f, %f, %f\n", rad.v[0], rad.v[1], rad.v[2]); */
+	/* return 0; */
 
 	/* SimpleHit hit = intersectObjects(numObjects, objects, &test); */
 
@@ -590,7 +775,7 @@ SimpleHit intersectObjects(int numObjects, Object* objects, Ray *ray) {
 	return firstHit;
 }
 
-Triple radiance(int numObjects, Object* objects, Ray *ray, int depth) {
+Triple radiance(int numObjects, Object* objects, Ray* ray, int depth) {
 	if (depth > maxDepth) {
 		return BLACK;
 	}
@@ -602,14 +787,14 @@ Triple radiance(int numObjects, Object* objects, Ray *ray, int depth) {
 
 	Material* mat = hit.object->material;
 
-	// TODO Implement dielectrics.
-	if (!mat->dielectric) {
+	if (!mat->dielectric(mat)) {
 		Triple wo = scale(&ray->dir, -1);
 		Triple normal = orientNormal(&hit.normal, &wo);
 		SampleHit sample = mat->sampleF(mat, &normal, &wo);
 		Triple f = mat->f(mat, &sample.dir, &wo, &normal);
 
 		Ray newRay = (Ray){.org = rayHit(ray, hit.t), .dir = sample.dir};
+
 		Triple nextDepth = radiance(numObjects, objects, &newRay, depth + 1);
 
 		Triple nextColor = multiplyParts(&nextDepth, &f);
@@ -620,9 +805,94 @@ Triple radiance(int numObjects, Object* objects, Ray *ray, int depth) {
 		return add(&result, &emiss);
 	}
 
-	printf("Hit a dielectric, unhandled.\n");
-	return MAGENTA;
+	Ray newRay = (Ray){.org = rayHit(ray, hit.t), .dir = ray->dir};
+
+	return diRadiance(numObjects, objects, &newRay, &hit.normal, mat, depth);
 }
+
+Triple diRadiance(int numObjects, Object* objects, Ray* ray, Triple* normal, Material* mat, int depth) {
+	Triple doubleNormal = scale(normal, 2);
+	scalePointer(&doubleNormal, innerProduct(normal, &ray->dir));
+	Triple reflDir = subtract(&ray->dir, &doubleNormal);
+
+	Triple orientedNormal = orientNormal(normal, &ray->dir);
+	scalePointer(&orientedNormal, -1);
+
+	// TODO BUGBUG Epsilon check here?
+	bool into = innerProduct(normal, &orientedNormal) > 0.0;
+
+	double nc = 1.0;
+	double nt = 1.5;
+
+	double ddn = innerProduct(&ray->dir, &orientedNormal);
+
+	double nnt = into ? nc / nt : nt / nc;
+
+	double cos2t = 1 - nnt * nnt * (1 - ddn * ddn);
+
+	// TODO BUGBUG Another epsilon check?
+	if (cos2t < 0.0) {
+		Ray newRay = (Ray){.org = ray->org, .dir = reflDir};
+		Triple result = mat->emiss(mat);
+		Triple nextResult = radiance(numObjects, objects, &newRay, depth + 1);
+		addPointer(&result, &nextResult);
+		return result;
+	}
+
+	double intoTerm = into ? 1.0 : -1.0;
+
+	Triple tdir = scale(&ray->dir, nnt);
+	Triple normTerm = scale(normal, intoTerm);
+	scalePointer(&normTerm, (ddn * nnt + sqrt(cos2t)));
+	subtractPointer(&tdir, &normTerm);
+	normalize(&tdir);
+
+	double a = nt - nc;
+	double b = nt + nc;
+	double r0 = a * a / (b * b);
+
+	double c = into ? 1 + ddn : 1 - innerProduct(&tdir, normal);
+
+	double re = r0 + (1 - r0) * pow(c, 4);
+	double tr = 1 - re;
+	double p = 0.25 + 0.5 * re;
+	double rp = re / p;
+	double tp = tr / (1 - p);
+
+	Triple result;
+
+	if (depth <= 2) {
+		Ray reflectRay = (Ray){.org = ray->org, .dir = reflDir};
+		result = radiance(numObjects, objects, &reflectRay, depth + 1);
+		scalePointer(&result, re);
+
+		Ray refractRay = (Ray){.org = ray->org, .dir = tdir};
+
+		Triple refractRad = radiance(numObjects, objects, &refractRay, depth + 1);
+		scalePointer(&refractRad, tr);
+
+		addPointer(&result, &refractRad);
+	} else {
+		if (doubleRand() < p) {
+			Ray reflectRay = (Ray){.org = ray->org, .dir = reflDir};
+			result = radiance(numObjects, objects, &reflectRay, depth + 1);
+			scalePointer(&result, rp);
+		} else {
+			Ray refractRay = (Ray){.org = ray->org, .dir = tdir};
+			result = radiance(numObjects, objects, &refractRay, depth + 1);
+			scalePointer(&result, tp);
+		}
+	}
+
+	// TODO Is this the right thing to do? It looks alright :/
+	SampleHit sample = mat->sampleF(mat, normal, &ray->dir);
+	scalePointer(&result, innerProduct(&sample.dir, normal) / sample.pdf);
+
+	Triple emiss = mat->emiss(mat);
+	addPointer(&result, &emiss);
+	return result;
+}
+
 
 void render(int numObjects, Object* objects, Camera* camera, char* buffer) {
 	cameraCalcOrthonormalBasis(camera);
